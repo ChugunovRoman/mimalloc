@@ -1,5 +1,5 @@
 /* ----------------------------------------------------------------------------
-Copyright (c) 2018,2019 Microsoft Research, Daan Leijen
+Copyright (c) 2018-2020 Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
 terms of the MIT license.
 -----------------------------------------------------------------------------*/
@@ -20,13 +20,12 @@ terms of the MIT license.
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
-#include <mimalloc.h>
 
 // > mimalloc-test-stress [THREADS] [SCALE] [ITER]
 //
 // argument defaults
 static int THREADS = 32;      // more repeatable if THREADS <= #processors
-static int SCALE   = 10;      // scaling factor
+static int SCALE   = 25;      // scaling factor
 static int ITER    = 50;      // N full iterations destructing and re-creating all threads
 
 // static int THREADS = 8;    // more repeatable if THREADS <= #processors
@@ -38,12 +37,14 @@ static bool   allow_large_objects = true;    // allow very large objects?
 static size_t use_one_size = 0;              // use single object size of `N * sizeof(uintptr_t)`?
 
 
+// #define USE_STD_MALLOC
 #ifdef USE_STD_MALLOC
-#define custom_calloc(n,s)    calloc(n,s)
+#define custom_calloc(n,s)    malloc(n*s)
 #define custom_realloc(p,s)   realloc(p,s)
 #define custom_free(p)        free(p)
 #else
-#define custom_calloc(n,s)    mi_calloc(n,s)
+#include <mimalloc.h>
+#define custom_calloc(n,s)    mi_malloc(n*s)
 #define custom_realloc(p,s)   mi_realloc(p,s)
 #define custom_free(p)        mi_free(p)
 #endif
@@ -90,7 +91,7 @@ static bool chance(size_t perc, random_t r) {
 
 static void* alloc_items(size_t items, random_t r) {
   if (chance(1, r)) {
-    if (chance(1, r) && allow_large_objects) items *= 10000;       // 0.01% giant
+    if (chance(1, r) && allow_large_objects) items *= 50000;       // 0.01% giant
     else if (chance(10, r) && allow_large_objects) items *= 1000;  // 0.1% huge
     else items *= 100;                                             // 1% large objects;
   }
@@ -123,7 +124,7 @@ static void free_items(void* p) {
 
 static void stress(intptr_t tid) {
   //bench_start_thread();
-  uintptr_t r = (tid * 43); // rand();
+  uintptr_t r = ((tid + 1) * 43); // rand();
   const size_t max_item_shift = 5; // 128
   const size_t max_item_retained_shift = max_item_shift + 2;
   size_t allocs = 100 * ((size_t)SCALE) * (tid % 8 + 1); // some threads do more
@@ -181,17 +182,20 @@ static void run_os_threads(size_t nthreads, void (*entry)(intptr_t tid));
 static void test_stress(void) {
   uintptr_t r = rand();
   for (int n = 0; n < ITER; n++) {
-    run_os_threads(THREADS, &stress);
+    run_os_threads(THREADS, &stress);    
     for (int i = 0; i < TRANSFERS; i++) {
       if (chance(50, &r) || n + 1 == ITER) { // free all on last run, otherwise free half of the transfers
         void* p = atomic_exchange_ptr(&transfer[i], NULL);
         free_items(p);
       }
     }
-    // mi_collect(false);
-#ifndef NDEBUG
+    #ifndef NDEBUG
+    //mi_collect(false);
+    //mi_debug_show_arenas();
+    #endif    
+    #if !defined(NDEBUG) || defined(MI_TSAN)
     if ((n + 1) % 10 == 0) { printf("- iterations left: %3d\n", ITER - (n + 1)); }
-#endif
+    #endif
   }
 }
 
@@ -235,6 +239,7 @@ int main(int argc, char** argv) {
     if (n > 0) ITER = n;
   }
   printf("Using %d threads with a %d%% load-per-thread and %d iterations\n", THREADS, SCALE, ITER);
+  //mi_reserve_os_memory(1024*1024*1024ULL, false, true);
   //int res = mi_reserve_huge_os_pages(4,1);
   //printf("(reserve huge: %i\n)", res);
 
@@ -242,15 +247,26 @@ int main(int argc, char** argv) {
 
   // Run ITER full iterations where half the objects in the transfer buffer survive to the next round.
   srand(0x7feb352d);
-  // mi_stats_reset();
-#ifdef STRESS
-    test_stress();
-#else
-    test_leak();
+  
+  //mi_reserve_os_memory(512ULL << 20, true, true);
+
+#if !defined(NDEBUG) && !defined(USE_STD_MALLOC)
+  mi_stats_reset();
 #endif
 
-  // mi_collect(true);
+#ifdef STRESS
+  test_stress();
+#else
+  test_leak();
+#endif
+
+#ifndef USE_STD_MALLOC
+  #ifndef NDEBUG
+  mi_collect(true);
+  //mi_debug_show_arenas();
+  #endif
   mi_stats_print(NULL);
+#endif
   //bench_end_program();
   return 0;
 }
@@ -260,7 +276,7 @@ static void (*thread_entry_fun)(intptr_t) = &stress;
 
 #ifdef _WIN32
 
-#include <windows.h>
+#include <Windows.h>
 
 static DWORD WINAPI thread_entry(LPVOID param) {
   thread_entry_fun((intptr_t)param);
@@ -272,7 +288,7 @@ static void run_os_threads(size_t nthreads, void (*fun)(intptr_t)) {
   DWORD* tids = (DWORD*)custom_calloc(nthreads,sizeof(DWORD));
   HANDLE* thandles = (HANDLE*)custom_calloc(nthreads,sizeof(HANDLE));
   for (uintptr_t i = 0; i < nthreads; i++) {
-    thandles[i] = CreateThread(0, 4096, &thread_entry, (void*)(i), 0, &tids[i]);
+    thandles[i] = CreateThread(0, 8*1024, &thread_entry, (void*)(i), 0, &tids[i]);
   }
   for (size_t i = 0; i < nthreads; i++) {
     WaitForSingleObject(thandles[i], INFINITE);
@@ -305,7 +321,7 @@ static void run_os_threads(size_t nthreads, void (*fun)(intptr_t)) {
   pthread_t* threads = (pthread_t*)custom_calloc(nthreads,sizeof(pthread_t));
   memset(threads, 0, sizeof(pthread_t) * nthreads);
   //pthread_setconcurrency(nthreads);
-  for (uintptr_t i = 0; i < nthreads; i++) {
+  for (size_t i = 0; i < nthreads; i++) {
     pthread_create(&threads[i], NULL, &thread_entry, (void*)i);
   }
   for (size_t i = 0; i < nthreads; i++) {
